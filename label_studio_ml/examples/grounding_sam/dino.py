@@ -26,6 +26,7 @@ from torchvision.ops import nms
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import torch.nn.functional as F
+import re
 
 logger = logging.getLogger(__name__)
 LOG_PATH = '/app/dino_alias_log.jsonl'
@@ -41,7 +42,7 @@ def parse_project_labels(xml_conf: str) -> List[str]:
             seen.add(val)
     return ordered
 
-def embedding_map(raw: str, label_embs: torch.Tensor, ui_labels: List[str]) -> Optional[str]:
+def embedding_map(raw: str, label_embs: torch.Tensor, ui_labels, emb_threshold: float) -> Optional[str]:
     """Return the UI label with highest cosine similarity to raw, or None."""
     # normalize raw
     phrase_emb = embedder.encode(raw, convert_to_tensor=True)       # [D]
@@ -49,10 +50,72 @@ def embedding_map(raw: str, label_embs: torch.Tensor, ui_labels: List[str]) -> O
     sims = F.cosine_similarity(phrase_emb, label_embs)              # [N_labels]
     top_idx = int(torch.argmax(sims).cpu().item())
     top_score = float(sims[top_idx].cpu().item())
-    if top_score >= EMB_THRESHOLD:
+    if top_score >= emb_threshold:
         return ui_labels[top_idx]
     return raw
 
+def embedding_map_batch(phrases: List[str], label_embs: torch.Tensor, ui_labels, emb_threshold: float) -> List[str]:
+    if not phrases:
+        return []
+    phr_t = embedder.encode(phrases, convert_to_tensor=True, normalize_embeddings=True)  # [M,D]
+    lbl_t = F.normalize(label_embs, dim=-1)                                             # [N,D]
+    sims  = phr_t @ lbl_t.T                                                             # [M,N]
+    top_scores, top_idx = sims.max(dim=1)                                              # [M]
+    out = []
+    for i, s in zip(top_idx.tolist(), top_scores.tolist()):
+        out.append(ui_labels[i] if s >= emb_threshold else phrases[len(out)])
+    return out
+
+def safe_parse_extra_params(raw):
+    """
+    Return dict or {}. Accept dict or JSON string.
+    Tolerates raw newlines/tabs by escaping them.
+    Never raises.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+
+        # Try strict JSON first
+        try:
+            val = json.loads(s)
+            return val if isinstance(val, dict) else {}
+        except json.JSONDecodeError:
+            pass
+
+        # Sanitize unescaped control chars that break JSON
+        s2 = re.sub(r'(?<!\\)\n', r'\\n', s)
+        s2 = re.sub(r'(?<!\\)\t', r'\\t', s2)
+        try:
+            val = json.loads(s2)
+            return val if isinstance(val, dict) else {}
+        except json.JSONDecodeError:
+            pass
+
+        # Python literal fallback for single-quoted dicts
+        try:
+            import ast
+            val = ast.literal_eval(s)
+            return val if isinstance(val, dict) else {}
+        except Exception:
+            logging.warning("extra_params parse failed; using {}")
+            return {}
+    logging.warning(f"extra_params type unsupported: {type(raw)}; using {{}}")
+    return {}
+
+def _safe_float(ep, key, default, minv=0.0, maxv=1.0):
+    try:
+        val = float(ep.get(key, default))
+        if val < minv or val > maxv:
+            raise ValueError
+        return val
+    except Exception:
+        logger.warning(f"Invalid {key} in extra_params, using default={default}")
+        return default
+    
 # Load GroundingDINO
 groundingdino_model = load_model(
     pathlib.Path(os.environ.get('GROUNDINGDINO_REPO_PATH', './GroundingDINO')) /
@@ -96,7 +159,7 @@ if USE_SAM or USE_MOBILE_SAM:
     logger.info('Loaded SAM model')
 
 # Load SentenceTransformer for label embeddings
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 logger.info("Loaded SentenceTransformer embedder")
 
 class DINOBackend(LabelStudioMLBase):
@@ -111,12 +174,18 @@ class DINOBackend(LabelStudioMLBase):
         self.label_embs = embedder.encode(ui_labels, convert_to_tensor=True)  # shape [N_labels, D]
 
         #get prompt from extra_params
-        ep: Dict = getattr(self, 'extra_params', {}) or {}
+        ep_raw = self.get('extra_params') or '{}'   # raw JSON string; don’t json.loads() here
+        ep: Dict = safe_parse_extra_params(ep_raw)
         raw_prompt = ep.get('prompt')
         self.project_prompt = self._format_prompt(raw_prompt)
         
+        #get thresholds from extra_params
+        self.box_threshold = _safe_float(ep, 'box_threshold', BOX_THRESHOLD)
+        self.text_threshold = _safe_float(ep, 'text_threshold', TEXT_THRESHOLD)
+        self.emb_threshold = _safe_float(ep, 'emb_threshold', EMB_THRESHOLD)
+        
         self.set('model_version', 'DINOBackend-v0.0.1')
-        logger.info(f'[init] prompt={self.project_prompt!r}, labels={self.ui_labels}')
+        logger.info(f'[init] prompt={self.project_prompt!r}, labels={self.ui_labels}, \n ARGUMENTS: box_th={self.box_threshold}, text_th={self.text_threshold}, emb_th={self.emb_threshold}')
 
     def predict(self,
                 tasks: List[Dict],
@@ -154,8 +223,8 @@ class DINOBackend(LabelStudioMLBase):
         
         boxes_xywh, logits, phrases = predict(
             groundingdino_model, img, prompt,
-            box_threshold=BOX_THRESHOLD,
-            text_threshold=TEXT_THRESHOLD,
+            box_threshold=self.box_threshold,
+            text_threshold=self.text_threshold,
             device=device
         )
         logger.debug(f"DINO returned phrases: {phrases!r}")
@@ -169,7 +238,7 @@ class DINOBackend(LabelStudioMLBase):
         phrases    = [ phrases[i] for i in keep ]
 
         points = boxes_xyxy.cpu().numpy()
-        labels = [ embedding_map(p, self.label_embs, self.ui_labels) for p in phrases ]
+        labels = [ embedding_map(p, self.label_embs, self.ui_labels, self.emb_threshold) for p in phrases ]
         self._log_aliases(phrases, labels, task.get('id'))
 
         # build your rect results dict
@@ -178,14 +247,15 @@ class DINOBackend(LabelStudioMLBase):
         # 1) if you _do_ have SAM, merge masks + boxes exactly as before:
         if USE_SAM or USE_MOBILE_SAM:
             mask_res = self._sam_single(img_path, points, labels, (H,W), fn_b, tn_b)
-            return {
-                'result':        rect_res['result'] + mask_res['result'],
-                'score':         (rect_res['score'] + mask_res['score']) / 2,
+            out = {
+                'result': rect_res['result'] + mask_res['result'],
+                'score':  (rect_res['score'] + mask_res['score']) / 2,
                 'model_version': self.get('model_version'),
             }
+            return out
 
         # 2) otherwise (no SAM), **return the full dict**, not just rect_res['result']:
-        mapping = [(p, embedding_map(p, self.label_embs, self.ui_labels)) for p in phrases]
+        mapping = [(p, embedding_map(p, self.label_embs, self.ui_labels, self.emb_threshold)) for p in phrases]
         for raw_phrase, ui_label in mapping:
             logger.info(f"[DEBUG] {raw_phrase:<30} → {ui_label}")
         print("\n[ DINO → UI LABELS ]")
@@ -195,55 +265,86 @@ class DINOBackend(LabelStudioMLBase):
 
 
     def multiple_tasks(self, tasks, prompt, fn_r, tn_r, fn_b, tn_b, img_key):
-        img_paths, HWs = [], []
+        # hyperparams
+        IOU_THR = 0.5
+        MAX_DETS = 50
+        CHUNK = int(os.environ.get('BATCH_CHUNK', 8))  # process tasks in chunks
+
+        # single pass image loading
+        img_items = []  # [(task, img_path, src, img_dino)]
         for t in tasks:
             raw = t['data'][img_key]
             try:
                 p = get_local_path(raw, ls_access_token=LABEL_STUDIO_TOKEN, ls_host=LABEL_STUDIO_HOST)
             except:
                 p = raw
-            img_paths.append(p)
-            src, _ = load_image(p)
-            HWs.append(src.shape[:2])
-
-        boxes_b, scores_b, phrases_b = [], [], []
-        for p in img_paths:
-            _, im = load_image(p)
-            b, s, ph = predict(
-                groundingdino_model, im, prompt,
-                BOX_THRESHOLD, TEXT_THRESHOLD, device
-            )
-            boxes_b.append(b)
-            scores_b.append(s)
-            phrases_b.append(ph)
+            src, img_dino = load_image(p)  # src: HxWx3 RGB, img_dino: model-ready tensor-like
+            img_items.append((t, p, src, img_dino))
 
         rect_results, sam_boxes, sam_labels = [], [], []
-        for b, s, ph, (H, W), task in zip(boxes_b, scores_b, phrases_b, HWs, tasks):
-            bxy = box_ops.box_cxcywh_to_xyxy(b) * torch.tensor([W,H,W,H])
-            keep = nms(bxy, s, 0.5)[:50]
-            bxy, s, ph = bxy[keep], s[keep], [ph[i] for i in keep]
 
-            labels = [embedding_map(x, self.label_embs, self.ui_labels) for x in ph]
-            self._log_aliases(ph, labels, task.get('id'))
+        # chunked predict to control VRAM spikes
+        for i in range(0, len(img_items), CHUNK):
+            batch = img_items[i:i+CHUNK]
+            # DINO forward per image under AMP + inference_mode
+            for t, p, src, img_dino in batch:
+                H, W, _ = src.shape
+                b_xywh, logits, phrases = predict(
+                    groundingdino_model, img_dino, prompt,
+                    box_threshold=self.box_threshold,
+                    text_threshold=self.text_threshold,
+                    device=device
+                )
 
-            rect_results.append(self._rect_results(
-                bxy.cpu().numpy(), s, [(H,W)]*len(labels), labels, fn_r, tn_r
-            ))
-            sam_boxes.append(bxy.cpu().numpy())
-            sam_labels.append(labels)
 
-        if not ckpt:
-            return [r['result'] for r in rect_results]
+                # boxes to xyxy on GPU, keep scores as tensor on GPU
+                b_xyxy = box_ops.box_cxcywh_to_xyxy(b_xywh) * torch.tensor([W, H, W, H], device=b_xywh.device, dtype=b_xywh.dtype)
+                scores = logits if isinstance(logits, torch.Tensor) else torch.as_tensor(logits, device=b_xyxy.device)
+                keep = nms(b_xyxy, scores, IOU_THR)[:MAX_DETS]
+
+                b_xyxy = b_xyxy[keep]
+                scores = scores[keep]
+                phrases = [phrases[j] for j in keep.tolist()]
+
+                # vectorized label mapping
+                labels = embedding_map_batch(phrases, self.label_embs, self.ui_labels, self.emb_threshold)
+                self._log_aliases(phrases, labels, t.get('id'))
+
+                # move coords to CPU only when packaging the result
+                pts = b_xyxy.detach().to('cpu').numpy()
+                scs = scores.detach().to('cpu').tolist()
+
+                rect_results.append(self._rect_results(
+                    pts, scs, [(H, W)]*len(labels), labels, fn_r, tn_r
+                ))
+                sam_boxes.append((p, pts, (H, W)))  # keep path with boxes
+                sam_labels.append(labels)
+
+            torch.cuda.empty_cache()
+
+        # No SAM path
+        if not (USE_SAM or USE_MOBILE_SAM):
+            return [r for r in rect_results]
 
         brush_results = [{'result': [], 'score': 0.0} for _ in sam_boxes]
-        valid = [i for i,b in enumerate(sam_boxes) if b.shape[0]>0]
+        valid = [i for i, (_, b, _) in enumerate(sam_boxes) if b.shape[0] > 0]
         if valid:
-            sel_boxes  = [sam_boxes[i]  for i in valid]
-            sel_paths  = [img_paths[i]  for i in valid]
-            sel_labels = [sam_labels[i] for i in valid]
-            sam_out    = self._sam_batch(sel_boxes, sel_paths)
-            sel_brush  = self._sam_batch_results(sam_out, sel_labels, fn_b, tn_b)
-            for idx, br in zip(valid, sel_brush):
+            # pack by image
+            sel_paths  = [sam_boxes[i][0] for i in valid]
+            sel_boxes  = [sam_boxes[i][1] for i in valid]
+            sel_sizes  = [sam_boxes[i][2] for i in valid]
+            sel_labels = [sam_labels[i]     for i in valid]
+
+            sam_out = self._sam_batch(sel_boxes, sel_paths)  # already batched
+
+            # build brush results
+            built = []
+            for out_i, lbls, (H, W) in zip(sam_out, sel_labels, sel_sizes):
+                masks = out_i["masks"][:, 0].cpu().numpy().astype(np.uint8)
+                probs = out_i["iou_predictions"].cpu().numpy()
+                built.append(self._sam_predictions(masks, probs, lbls, [(H, W)]*len(lbls), fn_b, tn_b))
+
+            for idx, br in zip(valid, built):
                 brush_results[idx] = br
 
         final = []
@@ -255,37 +356,59 @@ class DINOBackend(LabelStudioMLBase):
             })
         return final
 
+    @torch.inference_mode()
     def _sam_single(self, img_path, pts, labels, size, fn_b, tn_b):
         H, W = size
         img = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
         predictor.set_image(img)
-        boxes = predictor.transform.apply_boxes_torch(
-            torch.from_numpy(np.asarray(pts)), img.shape[:2]
-        ).to(device)
-        masks, probs, _ = predictor.predict_torch(
-            None, None, boxes, multimask_output=False
-        )
-        masks = masks[:,0].cpu().numpy().astype(np.uint8)
+        boxes = predictor.transform.apply_boxes_torch(torch.from_numpy(np.asarray(pts)).to(device), img.shape[:2])
+        if device == 'cuda':
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                masks, probs, _ = predictor.predict_torch(None, None, boxes, multimask_output=False)
+        else:
+            masks, probs, _ = predictor.predict_torch(None, None, boxes, multimask_output=False)
+        masks = masks[:, 0].cpu().numpy().astype(np.uint8)
         probs = probs.cpu().numpy()
         del boxes # free memory
         return self._sam_predictions(masks, probs, labels, [(H,W)]*len(labels), fn_b, tn_b)
 
+    @torch.inference_mode()
     def _sam_batch(self, boxes_list, img_paths):
+        # mini-batch SAM to avoid OOM
         resize = ResizeLongestSide(sam.image_encoder.img_size)
-        batch = []
-        for bxy, p in zip(boxes_list, img_paths):
-            img = cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB)
-            # ← convert numpy→torch BEFORE apply_boxes_torch
-            box_tensor = torch.from_numpy(bxy).to(device)
-            batch.append({
-                "image": self._prep(img, resize),
-                "boxes": resize.apply_boxes_torch(box_tensor, img.shape[:2]),
-                "original_size": img.shape[:2]
-            })
-        out = sam(batch, multimask_output=False)
-        for o, i in zip(out, batch):
-            o["original_size"] = i["original_size"]
-        return out
+        SAM_BS = int(os.environ.get('SAM_BATCH', 1))  # default safest
+        outs = []
+
+        for start in range(0, len(img_paths), SAM_BS):
+            end = start + SAM_BS
+            sub_boxes = boxes_list[start:end]
+            sub_paths = img_paths[start:end]
+
+            subbatch = []
+            for bxy, p in zip(sub_boxes, sub_paths):
+                img = cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB)
+                box_tensor = torch.from_numpy(bxy).to(device)
+                subbatch.append({
+                    "image": self._prep(img, resize),
+                    "boxes": resize.apply_boxes_torch(box_tensor, img.shape[:2]),
+                    "original_size": img.shape[:2]
+                })
+
+            if device == 'cuda':
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    out = sam(subbatch, multimask_output=False)
+            else:
+                out = sam(subbatch, multimask_output=False)
+
+            for o, i in zip(out, subbatch):
+                o["original_size"] = i["original_size"]
+                outs.append(o)
+
+            # free per-mini-batch
+            del subbatch, out
+            torch.cuda.empty_cache()
+
+        return outs
 
     def _prep(self, img, resize):
         im = resize.apply_image(img)
