@@ -327,7 +327,7 @@ class DINOBackend(LabelStudioMLBase):
             return [r for r in rect_results]
 
         brush_results = [{'result': [], 'score': 0.0} for _ in sam_boxes]
-        valid = [i for i,b in enumerate(sam_boxes) if b.shape[0]>0]
+        valid = [i for i, (_, b, _) in enumerate(sam_boxes) if b.shape[0] > 0]
         if valid:
             # pack by image
             sel_paths  = [sam_boxes[i][0] for i in valid]
@@ -374,24 +374,41 @@ class DINOBackend(LabelStudioMLBase):
 
     @torch.inference_mode()
     def _sam_batch(self, boxes_list, img_paths):
+        # mini-batch SAM to avoid OOM
         resize = ResizeLongestSide(sam.image_encoder.img_size)
-        batch = []
-        for bxy, p in zip(boxes_list, img_paths):
-            img = cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB)
-            box_tensor = torch.from_numpy(bxy).to(device)
-            batch.append({
-                "image": self._prep(img, resize),
-                "boxes": resize.apply_boxes_torch(box_tensor, img.shape[:2]),
-                "original_size": img.shape[:2]
-            })
-        if device == 'cuda':
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                out = sam(batch, multimask_output=False)
-        else:
-            out = sam(batch, multimask_output=False)
-        for o, i in zip(out, batch):
-            o["original_size"] = i["original_size"]
-        return out
+        SAM_BS = int(os.environ.get('SAM_BATCH', 1))  # default safest
+        outs = []
+
+        for start in range(0, len(img_paths), SAM_BS):
+            end = start + SAM_BS
+            sub_boxes = boxes_list[start:end]
+            sub_paths = img_paths[start:end]
+
+            subbatch = []
+            for bxy, p in zip(sub_boxes, sub_paths):
+                img = cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB)
+                box_tensor = torch.from_numpy(bxy).to(device)
+                subbatch.append({
+                    "image": self._prep(img, resize),
+                    "boxes": resize.apply_boxes_torch(box_tensor, img.shape[:2]),
+                    "original_size": img.shape[:2]
+                })
+
+            if device == 'cuda':
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    out = sam(subbatch, multimask_output=False)
+            else:
+                out = sam(subbatch, multimask_output=False)
+
+            for o, i in zip(out, subbatch):
+                o["original_size"] = i["original_size"]
+                outs.append(o)
+
+            # free per-mini-batch
+            del subbatch, out
+            torch.cuda.empty_cache()
+
+        return outs
 
     def _prep(self, img, resize):
         im = resize.apply_image(img)
